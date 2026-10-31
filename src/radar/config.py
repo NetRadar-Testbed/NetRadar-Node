@@ -1,0 +1,140 @@
+"""
+Radar System Configuration
+"""
+
+import numpy as np
+
+USE_CUDA = False  # Processing stage uses optimised CPU path (rdm_v3).
+                    # DBSCAN GPU acceleration configured separately in clustering_v3.
+
+# RDM implementation: "v3" (scatter/gather de-interleave) or "v4" (strided
+# reshape/transpose de-interleave, vectorized background, fftshift folded into
+# the window, FFTW_MEASURE + persisted wisdom). Flip to "v3" to roll back.
+RDM_IMPL = "v4"
+
+# Dimension Parameters
+FAST_TIME = 512
+SLOW_TIME = 64
+RX = 4  # Number of receive antennas
+TX = 3  # Number of transmit antennas
+IQ = 2  # I and Q channels
+IQ_BYTES = 2  # Bytes per IQ sample
+BUFFER_SIZE = 2048
+
+# Physical Parameters (from MATLAB)
+SPEED_OF_LIGHT = 3e8
+C = SPEED_OF_LIGHT
+FS = 10e6              # Sampling rate
+CARRIER_FREQ = 76e9    # F_CARRIER: Matlab uses 76e9
+F_CARRIER = CARRIER_FREQ
+S = 83e12              # Chirp slope
+T_F = 150e-3           # Frame period
+
+T_IDLE = 7e-6 
+T_CHIRP_RAMP_END_TIME = 60e-6 
+
+#T_SAMPLING = 
+
+T_CHIRP_RAMP = FAST_TIME/FS 
+
+
+T_IDLE = 7e-6 
+T_CHIRP_RAMP_END_TIME = 60e-6 
+
+#T_SAMPLING = 
+
+T_CHIRP_RAMP_DURATION = FAST_TIME/FS 
+
+
+# Derived Parameters
+#BW = 4.2492e9          # Bandwidth
+BW = S * T_CHIRP_RAMP_DURATION
+LAMBDA = SPEED_OF_LIGHT / CARRIER_FREQ
+#T_CHIRP_RAMP = BW / S  # MATLAB: T_chirp_ramp
+
+T_CHIRP = T_CHIRP_RAMP_END_TIME + T_IDLE
+
+#chirp ramp end time
+#adc sampling rate
+#
+
+#CHIRP_DURATION = T_CHIRP_RAMP # Alias for compatibility
+CHIRP_DURATION = T_CHIRP
+NUM_CHIRPS_PER_FRAME = SLOW_TIME
+N_CHIRPS_PER_FRAME_TDM = NUM_CHIRPS_PER_FRAME * TX
+T_F_EFFECTIVE = T_CHIRP * N_CHIRPS_PER_FRAME_TDM
+
+
+RANGE_BINS = FAST_TIME
+DOPPLER_BINS = SLOW_TIME
+
+
+# Range + Doppler metrics
+RANGE_RES = SPEED_OF_LIGHT / (2.0 * BW)
+DOPPLER_RES = LAMBDA / (2.0 * T_F_EFFECTIVE)
+MAX_RANGE = FS * SPEED_OF_LIGHT / (2.0 * S)
+
+# Max unambiguous velocity
+MAX_VELOCITY = LAMBDA / (4.0 * T_CHIRP * TX)
+VELOCITY_RES = DOPPLER_RES
+
+# Data Acquisition
+PORT = 4098
+BYTES_IN_PACKET = 1456
+BYTES_IN_FRAME = SLOW_TIME * FAST_TIME * RX * TX * IQ * IQ_BYTES
+BYTES_IN_FRAME_CLIPPED = (BYTES_IN_FRAME // BYTES_IN_PACKET) * BYTES_IN_PACKET
+
+# Visualization
+RANGE_ANGLE_PLOT_WIDTH = 400
+RANGE_ANGLE_PLOT_HEIGHT = 300
+
+# Measurement Noise Parameters (for Mahalanobis distance)
+SIGMA_RANGE = 0.035
+SIGMA_DOPPLER = 0.1534
+#SIGMA_AZIMUTH = np.pi / 4
+SIGMA_AZIMUTH = np.pi / 4
+
+MEASUREMENT_NOISE = np.array(
+    [[SIGMA_RANGE**2, 0, 0], [0, SIGMA_DOPPLER**2, 0], [0, 0, SIGMA_AZIMUTH**2]]
+)
+
+#
+SIGMA_A = 0.1
+
+PROCESS_NOISE = np.eye(4) * SIGMA_A
+#PROCESS_NOISE = 
+
+#DBSCAN
+MIN_SAMPLES = 5
+
+
+#JPDA Parameters
+AZIMUTH_SPAN = 2 * np.pi 
+RANGE_SPAN = MAX_RANGE
+DOPPLER_SPAN = MAX_VELOCITY
+MEASUREMENT_VOLUME = RANGE_SPAN * DOPPLER_SPAN * AZIMUTH_SPAN
+CLUTTER_DENSITY = 5 / MEASUREMENT_VOLUME
+DETECTION_PROBABILITY = 0.9
+#GATING_THRESHOLD = 12
+GATING_THRESHOLD = 12
+MAX_NUM_FEASIBLE_JOINT_EVENTS = 3
+
+#Multi-Target Track Management
+THRESHOLD_INIT = 0.05
+THRESHOLD_HIT_MISS = 0.3
+THRESHOLD_MERGE = 7
+
+CONSECUTIVE_MISS_THRESHOLD = 5
+CONSECUTIVE_HIT_THRESHOLD = 5
+TRACK_HIT_HISTORY = 8
+
+CLUSTER_MAX_POWER_THRESHOLD = 80
+#CLUSTER_MAX_POWER_THRESHOLD = 0
+
+# Output enrichment: attach per-cluster member detections and cast cluster/track
+# payload values to half-precision via f16(). Disabled by default to keep the
+# lean post-DBSCAN path — building per-cluster detections is an O(N_detections)
+# Python loop with per-call numpy-scalar boxing that measurably slows the
+# post-DBSCAN process (the dominant PACK/CENTROID cost). Enable only if the
+# dashboard/DB consumer needs the per-cluster detection lists.
+EMIT_PER_CLUSTER_DETECTIONS = False

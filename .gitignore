@@ -1,0 +1,29 @@
+# --- Secrets / local configuration (never commit) ---
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# --- Build outputs ---
+setup_radar/build/
+DCA1000/SourceCode/Release/*
+!DCA1000/SourceCode/Release/DCAconfig.json
+src/hardware_trigger/local_trigger
+src/hardware_trigger_mqtt/trigger_worker
+*.o
+
+# --- Runtime data ---
+logs/
+test/data/
+*.log
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store

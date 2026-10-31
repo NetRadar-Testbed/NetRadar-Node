@@ -1,0 +1,473 @@
+import asyncio
+import base64
+import logging
+import time
+import sys
+import os
+import numpy as np
+import cv2
+from aiohttp import web
+import socketio
+from jinja2 import Environment, FileSystemLoader
+
+# Add project root to sys.path to allow absolute imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+try:
+    from src.radar import config
+except ImportError:
+    from ..radar import config
+
+# Configuration
+SHOW_RANGE_ANGLE_PLOT = True
+RANGE_ANGLE_PLOT_WIDTH = 400
+RANGE_ANGLE_PLOT_HEIGHT = 300
+
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [SERVER] %(levelname)s %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# Debug level: 0 = only 50-frame avg, 1 = all logs
+DEBUG_LEVEL = 0
+
+def debug_print(msg):
+    if DEBUG_LEVEL >= 1:
+        logger.debug(msg)
+
+# Pre-compute RdBu colormap lookup table
+TRANSITION_MID = 128
+COLORMAP_BGR = np.zeros((256, 3), dtype=np.uint8)
+for i in range(256):
+    if i < TRANSITION_MID:
+        ratio = i / TRANSITION_MID
+        red = int(0 + 255 * ratio)
+        green = int(0 + 255 * ratio)
+        blue = int(139 + (255 - 139) * ratio)
+    else:
+        ratio = (i - TRANSITION_MID) / (255 - TRANSITION_MID)
+        red = int(255 - (255 - 139) * ratio)
+        green = int(255 * (1 - ratio))
+        blue = int(255 * (1 - ratio))
+    COLORMAP_BGR[i] = [blue, green, red]
+
+# Async SocketIO Server
+sio = socketio.AsyncServer(
+    async_mode='aiohttp',
+    cors_allowed_origins='*',
+    max_http_buffer_size=10000000 # 10MB to handle large radar frames
+)
+app = web.Application()
+sio.attach(app)
+
+@sio.event
+async def connect(sid, environ):
+    debug_print(f"DEBUG: Client connected: {sid}")
+
+@sio.event
+async def disconnect(sid):
+    debug_print(f"DEBUG: Client disconnected: {sid}")
+
+# Jinja2 setup
+template_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), 'templates'))
+jinja_env = Environment(loader=FileSystemLoader(template_dir))
+
+def array_to_raw_image(data_array):
+    """Optimized conversion of 64x512 array to 512x512 BGR image data"""
+    # Normalize to 0-255
+    normalized = cv2.normalize(data_array, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    # Resize to 512x512
+    scaled = cv2.resize(normalized, (512, 512), interpolation=cv2.INTER_NEAREST)
+    # Rotate 90 CCW
+    rotated = cv2.rotate(scaled, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    # Apply colormap
+    return COLORMAP_BGR[rotated]
+
+def encode_image_data(bgr_array):
+    """Encode BGR array as base64 JPEG data"""
+    success, buffer = cv2.imencode('.jpg', bgr_array, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return base64.b64encode(buffer).decode("ascii") if success else ""
+
+def extract_detections(cfar_array, angles_array, rdm_array=None):
+    """Vectorized extraction of detection information"""
+    detection_indices = np.where(cfar_array > 0)
+    doppler_indices = detection_indices[0]
+    range_indices = detection_indices[1]
+
+    if len(doppler_indices) == 0:
+        return []
+
+    angles = angles_array[doppler_indices, range_indices]
+
+    SLOW_TIME = config.SLOW_TIME
+    VELOCITY_RES = config.VELOCITY_RES
+
+    doppler_offsets = doppler_indices - SLOW_TIME // 2
+    velocities = doppler_offsets * VELOCITY_RES
+
+    magnitudes = rdm_array[doppler_indices, range_indices] if rdm_array is not None else np.zeros_like(velocities)
+
+    pixel_xs = doppler_indices * 8
+    pixel_ys = 511 - range_indices
+
+    return [
+        {
+            "x": int(px),
+            "y": int(py),
+            "doppler_idx": int(di),
+            "range_idx": int(ri),
+            "angle": float(a) if a != 0 else None,
+            "velocity": float(v),
+            "magnitude": float(m),
+        }
+        for px, py, di, ri, a, v, m in zip(pixel_xs, pixel_ys, doppler_indices, range_indices, angles, velocities, magnitudes)
+    ]
+
+class PerformanceStats:
+    def __init__(self):
+        self.last_arrival = 0
+        self.frame_count = 0
+        self.frame_times = []  # accumulated proc times for rolling average
+        self.frame_intervals = []  # accumulated arrival intervals
+
+stats = PerformanceStats()
+
+
+def print_frame_summary():
+    """Print average frame stats over the last N frames (debug-level independent)."""
+    n = len(stats.frame_times)
+    if n == 0:
+        return
+    avg_proc = sum(stats.frame_times) / n
+    avg_interval = sum(stats.frame_intervals) / n if stats.frame_intervals else 0.0
+    logger.info(
+        "[AVG] Last %d frames | Process: %.1fms | Interval: %.1fms",
+        n,
+        avg_proc,
+        avg_interval,
+    )
+    stats.frame_times = []
+    stats.frame_intervals = []
+
+
+def overlay_confirmed_tracks(bgr_image, confirmed_tracks_map, confirmed_tracks_angles):
+    """
+    Overlay confirmed tracks on the BGR image with distinct coloring (Bright Blue).
+
+    Args:
+        bgr_image: Base BGR image (512x512)
+        confirmed_tracks_map: 64x512 numpy array where non-zero values are track IDs
+        confirmed_tracks_angles: 64x512 numpy array containing angles
+
+    Returns:
+        BGR image with overlaid confirmed tracks
+    """
+    # Create a copy to avoid modifying original
+    overlay_image = bgr_image.copy()
+
+    if confirmed_tracks_map is None:
+        return overlay_image
+
+    # Distinct color for confirmed tracks: Bright Blue in BGR
+    TRACK_COLOR = (125, 0, 0)  # BGR format: Bright Blue (high B, medium G, low R)
+    TRACK_RADIUS = 20
+    TRACK_THICKNESS = 2
+    TEXT_COLOR = (255, 200, 100)  # Slightly lighter blue for text
+
+    # Find all coordinates where a track exists (value > 0)
+    doppler_indices, range_indices = np.where(confirmed_tracks_map > 0)
+
+    for d, r in zip(doppler_indices, range_indices):
+        track_id = int(confirmed_tracks_map[d, r])
+
+        # Convert from RDM space to image pixel space
+        # Image is 512x512 after rotation
+        # doppler_bin maps to x-axis (0-64 -> 0-512)
+        # range_bin maps to y-axis (0-512 -> 512-0, inverted)
+        pixel_x = int((d / 64.0) * 512)
+        pixel_y = int(512 - (r / 512.0) * 512)
+
+        # Clamp to image bounds
+        pixel_x = np.clip(pixel_x, 0, 511)
+        pixel_y = np.clip(pixel_y, 0, 511)
+
+        # Draw filled circle for track position
+        #cv2.circle(overlay_image, (pixel_x, pixel_y), TRACK_RADIUS, TRACK_COLOR, -1)
+
+        # Draw circle outline
+        #cv2.circle(overlay_image, (pixel_x, pixel_y), TRACK_RADIUS, TEXT_COLOR, TRACK_THICKNESS)
+
+        # Draw track ID label
+        #cv2.putText(overlay_image, f"T{track_id}", (pixel_x + 10, pixel_y - 10),
+        #           cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_COLOR, 1)
+
+        # Optional: Draw angle indicator if available
+        if confirmed_tracks_angles is not None:
+            angle = float(confirmed_tracks_angles[d, r])
+            if angle != 0: # Assuming 0 might mean no angle data
+                # Draw a line from center point in direction of angle
+                angle_rad = np.radians(angle)
+                line_length = 20
+                end_x = int(pixel_x + line_length * np.cos(angle_rad))
+                end_y = int(pixel_y - line_length * np.sin(angle_rad))
+                cv2.line(overlay_image, (pixel_x, pixel_y), (end_x, end_y), TEXT_COLOR, 2)
+
+    return overlay_image
+
+
+def array_to_raw_image_with_tracks(data_array, confirmed_tracks_map=None, confirmed_tracks_angles=None):
+    """
+    Complete pipeline: Convert 64x512 array to 512x512 BGR image with confirmed tracks overlaid.
+
+    Args:
+        data_array: 64x512 RDM power array
+        confirmed_tracks_map: Dict mapping track_id to [range_bin, doppler_bin]
+        confirmed_tracks_angles: Dict mapping track_id to angle_value
+
+    Returns:
+        512x512 BGR image with RDM data and confirmed tracks
+    """
+    # Original processing
+    normalized = cv2.normalize(data_array, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    scaled = cv2.resize(normalized, (512, 512), interpolation=cv2.INTER_NEAREST)
+    rotated = cv2.rotate(scaled, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    bgr_image = COLORMAP_BGR[rotated]
+
+    # Overlay confirmed tracks if provided
+    if confirmed_tracks_map is not None and len(confirmed_tracks_map) > 0:
+        #pass
+        bgr_image = overlay_confirmed_tracks(bgr_image, confirmed_tracks_map, confirmed_tracks_angles)
+
+    return bgr_image
+
+
+def package_track_data(tracks):
+
+    packaged = []
+    #if not isinstance(tracks, list):
+    #    return packaged
+
+    fast_time = getattr(config, "FAST_TIME", 512)
+    slow_time = getattr(config, "SLOW_TIME", 64)
+    range_res = getattr(config, "RANGE_RES", 0.05)
+    vel_res = getattr(config, "VELOCITY_RES", getattr(config, "DOPPLER_RES", 0.1))
+
+    # avoid divide-by-zero in degenerate configs
+    ft_m1 = max(1, fast_time - 1)
+    st_m1 = max(1, slow_time - 1)
+
+    for track in tracks:
+        track_id = track.get('TrackID')
+        state = track.get('State', [0, 0, 0, 0])
+        implied_detection = track.get('Implied Detection', [0, 0, 0])
+
+        #print(implied_detection)
+        if len(state) >= 4:
+            # 1. State extraction [x, vx, y, vy]
+            x, vx, y, vy = state[0], state[1], state[2], state[3]
+
+            # 2. Convert Cartesian to expected Radar values (Range, Velocity, Angle)
+            #range_val = (x**2 + y**2)**0.5
+            #vel_val = (x*vx + y*vy) / range_val if range_val > 0 else 0.0
+            #angle_val = np.arccos(np.clip(x / range_val, -1.0, 1.0)) if range_val > 0 else 0.0
+
+            range_val = implied_detection[0]
+            vel_val = implied_detection[1]
+            angle_val = implied_detection[2]
+
+            #print(range_val - implied_detection[0])
+            #print(vel_val - implied_detection[1])
+            #print(angle_val - implied_detection[2])
+
+            # 3. Convert expected values to Bins
+            range_bin = int(np.clip(int(round(range_val / range_res)), 0, fast_time - 1))
+            doppler_bin = int(np.clip(int(round(vel_val / vel_res)) + (slow_time // 2), 0, slow_time - 1))
+
+            # Map bins to pixel coordinates (0..fast_time-1 for both axes after rotation)
+            pixel_x = int(round((doppler_bin / float(st_m1)) * ft_m1))
+            # invert range so 0 range -> bottom of image
+            pixel_y = int(round((1.0 - (range_bin / float(ft_m1))) * ft_m1))
+
+            angle_degrees = float(angle_val) * 180/np.pi
+
+            packaged.append({
+                "track_id": int(track_id),
+                "x": int(np.clip(pixel_x, 0, fast_time - 1)),
+                "y": int(np.clip(pixel_y, 0, fast_time - 1)),
+                "range_bin": int(range_bin),
+                "doppler_bin": int(doppler_bin),
+                "angle": float(angle_degrees)
+            })
+
+    return packaged
+
+
+def process_frame(data):
+    """CPU-bound processing logic separated from the event loop"""
+    start_time = time.time()
+
+
+    # 1. Parse array
+    try:
+        array_data = np.frombuffer(data["array"], dtype=np.float32)
+        if array_data.size == 64 * 512:
+            array_data = array_data.reshape(64, 512)
+            #print(array_data)
+        else:
+            return None, 0
+    except Exception:
+        return None, 0
+
+    # 2. Process detections
+    detections = []
+    if data.get("angles") is not None and data.get("cfar") is not None:
+        try:
+            angles_array = np.frombuffer(data["angles"], dtype=np.float32).reshape(64, 512)
+            cfar_array = np.frombuffer(data["cfar"], dtype=np.float32).reshape(64, 512)
+            detections = extract_detections(cfar_array, angles_array, array_data)
+        except Exception:
+            pass
+    elif data.get("angles") is not None:
+        try:
+            angles_array = np.frombuffer(data["angles"], dtype=np.float32).reshape(64, 512)
+            # Robust fallback: create CFAR-like detection map from RDM data
+            threshold = np.mean(array_data) + 2 * np.std(array_data)
+            cfar_detections = (array_data > threshold).astype(np.uint8)
+            detections = extract_detections(cfar_detections, angles_array, array_data)
+        except Exception:
+            pass
+
+    # 3. Handle image with confirmed tracks overlay
+    confirmed_tracks_map = None
+    if data.get("confirmed_tracks_rd") is not None:
+        try:
+            confirmed_tracks_map = np.frombuffer(data["confirmed_tracks_rd"], dtype=np.float32).reshape(64, 512)
+        except Exception:
+            pass
+
+
+    confirmed_tracks_angles = None
+    if data.get("confirmed_tracks_angles") is not None:
+        try:
+            confirmed_tracks_angles = np.frombuffer(data["confirmed_tracks_angles"], dtype=np.float32).reshape(64, 512)
+        except Exception:
+            # Fallback if it's sent as a dictionary instead of bytes
+            confirmed_tracks_angles = data.get("confirmed_tracks_angles", {})
+
+    bgr_image = array_to_raw_image_with_tracks(
+        array_data,
+        confirmed_tracks_map,
+        confirmed_tracks_angles
+    )
+    image_data = encode_image_data(bgr_image)
+
+    # 4. Convert confirmed tracks to pixel coordinates for frontend
+    confirmed_tracks_data = data.get("confirmed_tracks", [])
+    confirmed_tracks = []
+
+    tentative_tracks_data = data.get("tentative_tracks", [])
+    tentative_tracks = []
+
+    try:
+        if not isinstance(confirmed_tracks_data, list):
+            debug_print("server.py: confirmed_tracks_data should be a list")
+            confirmed_tracks_data = []
+
+        # Safely fetch resolution values from config with fallbacks
+        range_res = getattr(config, 'RANGE_RES', 0.05)
+        vel_res = getattr(config, 'VELOCITY_RES', getattr(config, 'DOPPLER_RES', 0.1))
+        slow_time = getattr(config, 'SLOW_TIME', 64)
+
+        debug_print("Server.py ==============================")
+
+
+    except Exception as e:
+        debug_print(f"DEBUG: Error parsing confirmed tracks data: {e}")
+
+    proc_time = (time.time() - start_time) * 1000
+
+    #print(confirmed_tracks)
+
+    confirmed_tracks = package_track_data(confirmed_tracks_data)
+    tentative_tracks = package_track_data(tentative_tracks_data)
+
+    payload = {
+        "image": image_data,
+        "detections": detections,
+        "confirmed_tracks": confirmed_tracks,
+        "tentative_tracks": tentative_tracks,
+        "cluster_count": data.get("cluster_count", 0),
+        "clusters": data.get("clusters", []),
+        "mime": "image/jpeg"
+    }
+
+    #print("BRH ==============")
+    #print(confirmed_tracks)
+
+
+    return payload, proc_time
+
+@sio.on("send_frame")
+async def handle_array(sid, data):
+    """Async handler for incoming radar frames"""
+    now = time.time()
+    arrival_delta = (now - stats.last_arrival) * 1000 if stats.last_arrival > 0 else 0
+    stats.last_arrival = now
+    stats.frame_count += 1
+
+    try:
+        # Offload CPU work to a thread
+        payload, proc_time = await asyncio.to_thread(process_frame, data)
+
+        # Accumulate stats for rolling average
+        stats.frame_times.append(proc_time)
+        stats.frame_intervals.append(arrival_delta)
+
+        if payload:
+            await sio.emit("radar_plot", payload)
+            confirmed_count = len(payload.get("confirmed_tracks", []))
+            tentative_count = len(payload.get("tentative_tracks", []))
+            debug_print(f"Frame {stats.frame_count} | Arrival: {arrival_delta:.1f}ms | Process: {proc_time:.1f}ms | Detections: {len(payload['detections'])} | Confirmed Tracks: {confirmed_count}, Tentative Tracks: {tentative_count}")
+        else:
+            debug_print(f"server.py: Frame {stats.frame_count} | Arrival: {arrival_delta:.1f}ms | ERROR: process_frame returned None")
+
+        # Print rolling average every 50 frames (at any debug level)
+        if stats.frame_count % 50 == 0 and stats.frame_times:
+            print_frame_summary()
+
+    except Exception as e:
+        debug_print(f"server.py: Frame {stats.frame_count} | ERROR in handle_array: {e}")
+
+async def index_handler(request):
+    """Serve the main UI page using Jinja2"""
+    debug_print("DEBUG: index.html requested")
+    template = jinja_env.get_template('index.html')
+    content = template.render(
+        show_range_angle_plot=SHOW_RANGE_ANGLE_PLOT,
+        range_angle_plot_width=RANGE_ANGLE_PLOT_WIDTH,
+        range_angle_plot_height=RANGE_ANGLE_PLOT_HEIGHT,
+        max_velocity=config.MAX_VELOCITY,
+        max_range=config.MAX_RANGE,
+        range_res=config.RANGE_RES,
+        velocity_res=config.VELOCITY_RES,
+        slow_time=config.SLOW_TIME,
+        fast_time=config.FAST_TIME
+    )
+    return web.Response(text=content, content_type='text/html')
+
+async def status_handler(request):
+    """Simple health check"""
+    return web.Response(text="Server is UP", content_type='text/plain')
+
+# Setup routes
+app.router.add_get('/', index_handler)
+app.router.add_get('/status', status_handler)
+
+if __name__ == "__main__":
+    # UI_BIND_HOST is set by configure.sh to the node's Tailscale IP so the
+    # visualizer is only reachable from your own tailnet.
+    bind_host = os.getenv("UI_BIND_HOST", "0.0.0.0")
+    logger.info("Starting Optimized Asyncio/Aiohttp Radar Plotter on %s:5001", bind_host)
+    web.run_app(app, host=bind_host, port=5001, access_log=None)
