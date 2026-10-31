@@ -9,15 +9,15 @@ shared, clock-synchronized hardware trigger so their frames line up in time.
 - **Fusion center:** [NetRadar-FusionCenter](https://github.com/NetRadar-Testbed/NetRadar-FusionCenter)
 - **Full documentation:** <https://netradar-testbed.github.io>
 
-> NetRadar is built to be set up **from scratch on your own network**. Nothing in
-> this repository points at any existing deployment; you create your own
-> Tailscale network, fusion center and credentials.
+With this repository and NetRadar-FusionCenter you can build a complete testbed of
+your own: set up a Tailscale network, bring up the fusion center, then add as many
+radar nodes as you like. The setup scripts create fresh passwords along the way.
 
 ## Hardware (per node)
 
 <p align="center">
   <img src="docs/images/netradar-testbed.jpg" width="820" alt="Four NetRadar radar nodes on tripods in a lab, with close-ups of one node's Jetson Orin Nano, DCA1000EVM capture card and AWR2243BOOST radar"><br>
-  <em>A four-node NetRadar testbed. Each node: NVIDIA Jetson Orin Nano (compute + Wi-Fi), TI DCA1000EVM (ADC data capture), TI AWR2243BOOST (mmWave radar).</em>
+  <em>Our four-node testbed. Each node pairs an NVIDIA Jetson Orin Nano with a TI DCA1000EVM capture card and a TI AWR2243BOOST radar.</em>
 </p>
 
 - NVIDIA Jetson Orin Nano, JetPack 6.x
@@ -104,20 +104,10 @@ as fast for this workload as NVIDIA's CUDA wheel (`torch.cdist`, n = 2000:
 | `third_party/` | Unmodified FTDI D2XX driver |
 | `docs/ARCHITECTURE.md` | Detailed description of the node's processing pipeline |
 
-## Security notes
-
-- `.env` holds this node's MQTT password. It is created by `configure.sh`,
-  readable only by you and root, and ignored by git. Never commit it.
-- The node service runs as root (GPIO and radar setup need it) with systemd
-  sandboxing.
-- Keep the node and fusion center on a Tailscale network that only you control.
-
 ## Citing NetRadar
 
-If you use this software, or a testbed built with it, in published work, please
-cite the papers below **and** state that your testbed was built using the
-NetRadar open-source software (with the version). See `NOTICE` and
-<https://netradar-testbed.github.io/citing/>.
+**Using NetRadar in your research?** Please cite our papers, and mention in your
+paper that your testbed was built with NetRadar.
 
 ```bibtex
 @INPROCEEDINGS{11205142,
@@ -136,6 +126,12 @@ NetRadar open-source software (with the version). See `NOTICE` and
   pages={218-222},
   doi={10.1109/IEEECONF60004.2024.10942741}}
 ```
+
+## Contributing
+
+Contributions are welcome! Please fork the repository, make your changes on a branch
+and open a pull request against `main`. More details in
+[CONTRIBUTING.md](https://github.com/NetRadar-Testbed/.github/blob/main/CONTRIBUTING.md).
 
 ## Credits
 
